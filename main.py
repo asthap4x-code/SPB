@@ -16,6 +16,8 @@ from database import init_db, add_user, save_signal, recent_signals, stats, reco
 from ai_strategy import analyze as ai_analyze
 from stm_strategy import analyze as stm_analyze
 from random_strategy import analyze as random_analyze
+from stm_pvip_strategy import analyze as pvip_analyze
+from stm_pvip2_strategy import analyze as pvip2_analyze
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -41,7 +43,7 @@ MARKETS = {
 }
 CATEGORY_ORDER = ["FOREX", "COMMODITIES", "CRYPTO", "CURRENCY"]
 CATEGORY_LABELS = {"FOREX": "FOREX", "COMMODITIES": "COMMODITIES", "CRYPTO": "CRYPTO", "CURRENCY": "CURRENCY"}
-STRATEGY_LABELS = {"AI": "AI STRATEGY", "STM": "STM STRATEGY", "RANDOM": "RANDOM STRATEGY", "ALL": "SELECT ALL"}
+STRATEGY_LABELS = {"AI": "AI STRATEGY", "STM": "STM STRATEGY", "PVIP": "STM PVIP STRATEGY", "PVIP2": "STM PVIP 2 STRATEGY", "RANDOM": "RANDOM STRATEGY", "ALL": "SELECT ALL"}
 
 # Best-effort names for PyQuotex. Unsupported names are skipped, never fabricated into a signal.
 SYMBOLS = {
@@ -105,12 +107,24 @@ class QuotexDemoFeed:
             rows = []
             for c in raw:
                 try:
-                    rows.append({"time": float(c.get("time", c.get("from", 0))), "open": float(c["open"]), "high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"])})
+                    ts = float(c.get("time", c.get("from", 0)))
+                    op, hi, lo, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+                    if ts <= 0 or not all(map(lambda v: v == v and abs(v) != float("inf"), (op, hi, lo, cl))):
+                        continue
+                    if hi < max(op, cl, lo) or lo > min(op, cl, hi):
+                        continue
+                    rows.append({"time": ts, "open": op, "high": hi, "low": lo, "close": cl})
                 except (KeyError, TypeError, ValueError):
                     continue
             rows.sort(key=lambda x: x["time"])
+            # Refuse empty, stale, future, or malformed feed data. This does not prove
+            # the broker's displayed label; successful fresh candles are the availability check.
+            now = time.time()
+            rows = [r for r in rows if r["time"] <= now + 2]
             if len(rows) < 25:
                 raise MarketDataError(f"{asset}: পর্যাপ্ত valid candle নেই ({len(rows)}টি)।")
+            if now - rows[-1]["time"] > max(180, period * 3):
+                raise MarketDataError(f"{asset}: candle feed stale (সর্বশেষ candle {int(now - rows[-1]['time'])}s পুরোনো)।")
             return rows
         except MarketDataError:
             raise
@@ -234,7 +248,7 @@ def pair_keyboard(prefs):
     return InlineKeyboardMarkup(rows)
 
 def strategy_keyboard(prefs):
-    rows = [[InlineKeyboardButton(STRATEGY_LABELS[k], callback_data=f"strategy:{k}")] for k in ("AI", "STM", "RANDOM", "ALL")]
+    rows = [[InlineKeyboardButton(STRATEGY_LABELS[k], callback_data=f"strategy:{k}")] for k in ("AI", "STM", "PVIP", "PVIP2", "RANDOM", "ALL")]
     rows.append([InlineKeyboardButton("⬅️ Back to Pairs", callback_data="pairs_open")])
     return InlineKeyboardMarkup(rows)
 
@@ -361,10 +375,14 @@ async def _candle_outcome(symbol, candle_start, direction):
     """Return WIN/LOSS/DRAW for the requested 60-second candle, or UNKNOWN."""
     candles = await feed.candles(symbol, 60, 40)
     # Quotex timestamps are epoch seconds; allow small rounding differences.
-    candidates = [c for c in candles if candle_start - 2 <= c.get("time", 0) < candle_start + 60]
+    # Only accept the candle whose opening timestamp matches the requested minute.
+    # Do not accidentally substitute the following minute's candle.
+    candidates = [c for c in candles if abs(c.get("time", 0) - candle_start) <= 2]
     if not candidates:
-        raise MarketDataError(f"{symbol}: target candle not found")
-    candle = max(candidates, key=lambda c: c.get("time", 0))
+        raise MarketDataError(f"{symbol}: exact target candle {int(candle_start)} not found")
+    candle = candidates[0]
+    if time.time() < candle_start + SIGNAL_EXPIRY_SECONDS:
+        raise MarketDataError(f"{symbol}: target candle has not closed yet")
     if candle["close"] == candle["open"]:
         return "DRAW"
     candle_direction = "CALL" if candle["close"] > candle["open"] else "PUT"
@@ -461,28 +479,52 @@ async def run_analysis(message, uid, context):
         except Exception:
             log.warning("Could not delete warning message", exc_info=True)
     await message.reply_text("🔎 Analysis চলছে… এক cycle-এ সর্বোচ্চ ১টি signal পাঠানো হবে।")
-    methods = {"AI": ("AI STRATEGY", ai_analyze), "STM": ("STM STRATEGY", stm_analyze), "RANDOM": ("RANDOM STRATEGY", random_analyze)}
-    method_order = ["AI", "STM", "RANDOM"] if strategy == "ALL" else [strategy]
-    errors, found = [], None
+    methods = {
+        "AI": ("AI STRATEGY", ai_analyze),
+        "STM": ("STM STRATEGY", stm_analyze),
+        "PVIP": ("STM PVIP STRATEGY", pvip_analyze),
+        "PVIP2": ("STM PVIP 2 STRATEGY", pvip2_analyze),
+        "RANDOM": ("RANDOM STRATEGY", random_analyze),
+    }
+    method_order = ["AI", "STM", "PVIP", "PVIP2", "RANDOM"] if strategy == "ALL" else [strategy]
+    errors, found, valid_markets = [], None, []
+    # First establish which selected symbols actually return fresh, valid Quotex candles.
+    # RANDOM chooses direction only after this validation; it cannot invent a market.
+    for pair in pairs:
+        symbol = SYMBOLS.get(pair)
+        if not symbol:
+            errors.append(f"{pair}: symbol mapping নেই")
+            continue
+        try:
+            candles = await feed.candles(symbol, 60, 100)
+            valid_markets.append((pair, symbol, candles))
+        except Exception as exc:
+            log.warning("Market validation failed for %s (%s): %s", pair, symbol, exc)
+            errors.append(f"{pair} [{symbol}]: {type(exc).__name__}: {exc}")
+    if not valid_markets:
+        await message.reply_text(
+            "❌ কোনো নির্বাচিত pair-এর fresh Quotex candle যাচাই করা যায়নি। তাই ভুল/অপ্রাপ্য market দিয়ে signal পাঠানো হয়নি.\n\n" + "\n".join(errors[:6])
+        )
+        return
     for method_key in method_order:
-        label, method = methods[method_key]
-        # RANDOM really means random: no Quotex candle fetch is needed to choose a direction.
+        label, method = methods.get(method_key, (None, None))
+        if method is None:
+            errors.append(f"Unknown strategy: {method_key}")
+            continue
+        candidates = valid_markets.copy()
         if method_key == "RANDOM":
-            pair = secrets.choice(pairs)
-            found = {"pair": pair, "symbol": SYMBOLS.get(pair), "strategy": label,
-                     "direction": secrets.choice(("CALL", "PUT")), "confidence": 50,
-                     "reason": "Random direction; not market-derived."}
+            pair, symbol, candles = secrets.choice(candidates)
+            random_result = random_analyze(candles)
+            if random_result and random_result.get("direction") in ("CALL", "PUT"):
+                found = {"pair": pair, "symbol": symbol, "strategy": label, **random_result,
+                         "reason": "Random direction on a pair with validated fresh Quotex candles; not predictive."}
             break
-        for pair in pairs:
-            symbol = SYMBOLS.get(pair)
-            if not symbol:
-                continue
+        for pair, symbol, candles in candidates:
             try:
-                candles = await feed.candles(symbol, 60, 100)
                 result = method(candles)
             except Exception as exc:
-                log.warning("Analysis failed for %s: %s", pair, exc)
-                errors.append(f"{pair}: {type(exc).__name__}: {exc}")
+                log.warning("%s strategy failed for %s: %s", method_key, pair, exc)
+                errors.append(f"{pair}/{method_key}: {type(exc).__name__}: {exc}")
                 continue
             if result and result.get("direction") in ("CALL", "PUT"):
                 found = {"pair": pair, "symbol": symbol, "strategy": label, **result}
@@ -490,7 +532,7 @@ async def run_analysis(message, uid, context):
         if found:
             break
     if not found:
-        await message.reply_text("❌ Signal তৈরি হয়নি। Quotex candle data পাওয়া যায়নি বা strategy qualify করেনি.\n\n" + "\n".join(errors[:4]))
+        await message.reply_text("❌ Fresh Quotex candle পাওয়া গেছে, কিন্তু নির্বাচিত strategy কোনো valid setup দেয়নি।\n\n" + "\n".join(errors[:6]))
         return
     if not signals_enabled:
         await message.reply_text("🛑 Analysis চলাকালে admin signals OFF করেছেন; signal পোস্ট করা হয়নি।")
@@ -509,6 +551,15 @@ async def run_analysis(message, uid, context):
         await message.reply_text("🛑 Admin signal OFF করেছেন; scheduled signal পাঠানো হয়নি।")
         return
 
+    # Re-check the chosen pair shortly before posting so a disconnected/stale feed
+    # cannot silently pass as a live market. Direction stays from selected strategy.
+    try:
+        fresh = await feed.candles(found["symbol"], 60, 30)
+        if not fresh or time.time() - fresh[-1]["time"] > 180:
+            raise MarketDataError("latest candle is stale")
+    except Exception as exc:
+        await message.reply_text(f"❌ Signal বাতিল: {found['pair']} এর live Quotex candle পুনরায় যাচাই করা যায়নি ({type(exc).__name__}: {exc})")
+        return
     sid = await save_signal(uid, found["pair"], found["direction"], found["strategy"], int(found.get("confidence", 50)), found.get("reason", "Analysis"))
     signal_now = datetime.now()
     trade_dt = datetime.fromtimestamp(trade_start)
