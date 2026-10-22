@@ -28,6 +28,8 @@ CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 BOT_NAME = "STM PRO BOT"
 PAGE_SIZE = 10
 SIGNAL_EXPIRY_SECONDS = 60
+SIGNAL_LEAD_SECONDS = 5  # publish 5 seconds before the next minute starts
+FEEDBACK_ID = os.getenv("FEEDBACK_ID", "").strip()
 signals_enabled = True
 session_signals = []  # current process session; persisted outcomes remain in SQLite
 
@@ -322,58 +324,78 @@ async def stmop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"🛑 Signals OFF হয়েছে, কিন্তু report পাঠানো যায়নি: {type(exc).__name__}: {exc}")
 
 
-async def settle_signal(app, signal_id, pair, symbol, direction, destination, started_at):
-    """Try to verify the 1-minute candle result; never invent WIN/LOSS if data is unavailable."""
-    await asyncio.sleep(SIGNAL_EXPIRY_SECONDS + 2)
+async def _candle_outcome(symbol, candle_start, direction):
+    """Return WIN/LOSS/DRAW for the requested 60-second candle, or UNKNOWN."""
+    candles = await feed.candles(symbol, 60, 40)
+    # Quotex timestamps are epoch seconds; allow small rounding differences.
+    candidates = [c for c in candles if candle_start - 2 <= c.get("time", 0) < candle_start + 60]
+    if not candidates:
+        raise MarketDataError(f"{symbol}: target candle not found")
+    candle = max(candidates, key=lambda c: c.get("time", 0))
+    if candle["close"] == candle["open"]:
+        return "DRAW"
+    candle_direction = "CALL" if candle["close"] > candle["open"] else "PUT"
+    return "WIN" if candle_direction == direction else "LOSS"
+
+
+async def settle_signal(app, signal_id, pair, symbol, direction, destination, trade_start):
+    """Check the scheduled candle; if it loses, check one following candle for MTG.
+
+    The bot does not execute trades or know whether a user actually took MTG. The
+    reported second-candle recovery is a candle-based proxy, not broker P/L.
+    """
     outcome = "UNKNOWN"
     try:
-        candles = await feed.candles(symbol, 60, 30)
-        candidates = [c for c in candles if c.get("time", 0) >= started_at]
-        candle = candidates[-1] if candidates else candles[-1]
-        if candle["close"] > candle["open"]:
-            candle_direction = "CALL"
-        elif candle["close"] < candle["open"]:
-            candle_direction = "PUT"
-        else:
-            candle_direction = "DRAW"
-        if candle_direction == "DRAW":
-            outcome = "DRAW"
-        elif candle_direction == direction:
+        await asyncio.sleep(max(0, trade_start + SIGNAL_EXPIRY_SECONDS - time.time() + 2))
+        first = await _candle_outcome(symbol, trade_start, direction)
+        if first == "WIN":
             outcome = "WIN"
+        elif first == "DRAW":
+            outcome = "DRAW"
         else:
-            outcome = "LOSS"
-        if outcome in ("WIN", "LOSS", "DRAW"):
-            await record_result(signal_id, outcome)
+            # One additional minute is counted as a win if direction matches.
+            await asyncio.sleep(max(0, trade_start + 2 * SIGNAL_EXPIRY_SECONDS - time.time() + 2))
+            second = await _candle_outcome(symbol, trade_start + SIGNAL_EXPIRY_SECONDS, direction)
+            outcome = "WIN" if second == "WIN" else ("LOSS" if second == "LOSS" else "DRAW")
     except Exception as exc:
         log.warning("Result could not be verified for signal #%s: %s", signal_id, exc)
+
     for row in reversed(session_signals):
         if row.get("id") == signal_id:
             row["outcome"] = outcome
             break
-    direction_text = "🔴 𝗣𝗨𝗧" if direction == "PUT" else "🟢 𝗖𝗔𝗟𝗟"
-    result_text = "🌟 Non mtg 𝗪𝗜𝗡" if outcome == "WIN" else ("😣 𝗟𝗢𝗦𝗦" if outcome == "LOSS" else ("➖ DRAW" if outcome == "DRAW" else "⌛ RESULT UNVERIFIED"))
+    if outcome in ("WIN", "LOSS", "DRAW"):
+        try:
+            await record_result(signal_id, outcome)
+        except Exception:
+            log.exception("Could not save result for signal #%s", signal_id)
+
+    direction_text = "🔴 𝗣𝗨𝗧 ▼" if direction == "PUT" else "🟢 𝗖𝗔𝗟𝗟 ▲"
+    result_text = "🎉 𝗪𝗜𝗡 ✅" if outcome == "WIN" else ("😣 𝗟𝗢𝗦𝗦 ❌" if outcome == "LOSS" else ("➖ DRAW" if outcome == "DRAW" else "⌛ RESULT UNVERIFIED"))
     today_rows = _today_session_rows()
     settled = [x for x in today_rows if x.get("outcome") in ("WIN", "LOSS")]
     wins = sum(x.get("outcome") == "WIN" for x in settled)
     losses = sum(x.get("outcome") == "LOSS" for x in settled)
-    total_pair = [x for x in settled if x.get("pair") == pair]
-    pair_wins = sum(x.get("outcome") == "WIN" for x in total_pair)
-    pair_losses = sum(x.get("outcome") == "LOSS" for x in total_pair)
+    pair_rows = [x for x in settled if x.get("pair") == pair]
+    pair_wins = sum(x.get("outcome") == "WIN" for x in pair_rows)
+    pair_losses = sum(x.get("outcome") == "LOSS" for x in pair_rows)
     accuracy = wins / len(settled) * 100 if settled else 0
+    feedback = FEEDBACK_ID or "@your_feedback_username"
     result_post = (
-        "📊 STMPRO BOT 𝗥𝗘𝗦𝗨𝗟𝗧\n"
+        "📊 𝗦𝗧𝗠 𝗣𝗥𝗢 𝗕𝗢𝗧 — 𝗥𝗘𝗦𝗨𝗟𝗧\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Pair: {pair}\n"
-        f"⏱️ Time: {datetime.now().strftime('%H:%M')}\n"
+        f"⏱️ Trade time: {datetime.fromtimestamp(trade_start).strftime('%H:%M')}–{datetime.fromtimestamp(trade_start + 60).strftime('%H:%M')}\n"
         f"🔮 Direction: {direction_text}\n\n"
         f"{result_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔥 WIN: {wins} | 😣 LOSS: {losses}\n"
         f"💎 THIS PAIR: {pair_wins}W × {pair_losses}L\n"
-        f"📊 STM PRO BOT ACCURACY: {accuracy:.1f}%\n"
+        f"📊 ACCURACY: {accuracy:.1f}% (verified WIN/LOSS only)\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "Please share honest feedback: your Telegram username\n"
-        "⚠️ Result is based on the available 1-minute candle; if data was unavailable it is marked unverified."
+        f"💬 Feedback: {feedback}\n"
+        "Please share honest feedback to help keep the bot running.\n"
+        "⚠️ Candle-based estimate only; this bot does not execute trades or verify broker P/L."
     )
     try:
         await app.bot.send_message(chat_id=destination, text=result_post)
@@ -438,27 +460,43 @@ async def run_analysis(message, uid, context):
     if not signals_enabled:
         await message.reply_text("🛑 Analysis চলাকালে admin signals OFF করেছেন; signal পোস্ট করা হয়নি।")
         return
+    # Schedule the signal exactly 5 seconds before the next minute boundary.
+    # Example: if the trade minute is 20:19:00, post at 20:18:55.
+    current_ts = time.time()
+    trade_start = (int(current_ts // 60) + 1) * 60
+    signal_ts = trade_start - SIGNAL_LEAD_SECONDS
+    # If analysis finishes too late to give a full 5-second warning, use the next minute.
+    if signal_ts < current_ts + 0.5:
+        trade_start += 60
+        signal_ts = trade_start - SIGNAL_LEAD_SECONDS
+    await asyncio.sleep(max(0, signal_ts - time.time()))
+    if not signals_enabled:
+        await message.reply_text("🛑 Admin signal OFF করেছেন; scheduled signal পাঠানো হয়নি।")
+        return
+
     sid = await save_signal(uid, found["pair"], found["direction"], found["strategy"], int(found.get("confidence", 50)), found.get("reason", "Analysis"))
-    now = datetime.now()
-    session_signals.append({"id": sid, "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
+    signal_now = datetime.now()
+    trade_dt = datetime.fromtimestamp(trade_start)
+    session_signals.append({"id": sid, "date": trade_dt.strftime("%Y-%m-%d"), "time": trade_dt.strftime("%H:%M"),
                             "pair": found["pair"], "direction": found["direction"], "outcome": None})
     direction_text = "🔴 𝗣𝗨𝗧 ▼" if found["direction"] == "PUT" else "🟢 𝗖𝗔𝗟𝗟 ▲"
-    # Channel post when configured; otherwise send into the current chat.
     destination = CHANNEL_ID if CHANNEL_ID else message.chat_id
+    payout_text = "Not available from current Quotex feed"
+    # Do not invent payout. A payout value is only shown if a future supported adapter returns one.
     signal_post = (
-        "🤖 STM PRO BOT\n"
+        "🤖 𝗦𝗧𝗠 𝗣𝗥𝗢 𝗕𝗢𝗧\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Pair: {found['pair']}\n"
-        f"⏱️ START At: {now.strftime('%H:%M:%S')}\n"
+        f"📣 Signal time: {signal_now.strftime('%H:%M:%S')}\n"
+        f"⏱️ 𝗧𝗥𝗔𝗗𝗘 𝗧𝗜𝗠𝗘: {trade_dt.strftime('%H:%M:00')}–{datetime.fromtimestamp(trade_start + 59).strftime('%H:%M:%S')}\n"
         f"🔮 Direction: {direction_text}\n"
-        "💰 Payout: Not available\n"
+        f"💰 Payout: {payout_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "🎯 𝗦𝗜𝗚𝗡𝗔𝗟 𝗖𝗢𝗡𝗙𝗜𝗗𝗘𝗡𝗖𝗘\n"
         f"{'█' * 10} {int(found.get('confidence', 50))}%\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ 1-MIN CANDLE. Use at most one-step MTG only if you independently choose to trade.\n"
         f"Strategy: {found['strategy']} | Signal ID: #{sid}\n"
-        "⚠️ Random direction is not a predictive edge; result is not guaranteed."
+        "⚠️ 1-minute candle. Direction is not a guaranteed prediction."
     )
     try:
         await context.bot.send_message(chat_id=destination, text=signal_post)
@@ -466,9 +504,9 @@ async def run_analysis(message, uid, context):
         await message.reply_text(f"Signal save হয়েছে, কিন্তু post পাঠানো যায়নি: {type(exc).__name__}: {exc}")
         return
     if found.get("symbol"):
-        context.application.create_task(settle_signal(context.application, sid, found["pair"], found["symbol"], found["direction"], destination, time.time()))
+        context.application.create_task(settle_signal(context.application, sid, found["pair"], found["symbol"], found["direction"], destination, trade_start))
     else:
-        await message.reply_text("ℹ️ Signal post হয়েছে; pair symbol mapping না থাকায় automated result verify করা যাবে না।")
+        await message.reply_text("ℹ️ Signal post হয়েছে; pair symbol mapping না থাকায় result verify করা যাবে না।")
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
