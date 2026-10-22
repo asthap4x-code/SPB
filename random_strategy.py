@@ -1,35 +1,42 @@
-
+# random_strategy.py
 import random
+from typing import Any, Dict, List
 
 
 class RandomStrategy:
-    """Random UP/DOWN signals for testing only."""
+    def __init__(self):
+        self.name = "RANDOM"
 
-    name = "Random Strategy"
+    def analyze(self, candles=None) -> Dict[str, Any]:
+        if not candles:
+            return {
+                "signal": "WAIT",
+                "strategy": "RANDOM",
+                "reason": "No candle data",
+            }
 
-    def __init__(self, enabled=True):
-        self.enabled = enabled
+        signal = random.choice(["UP", "DOWN"])
 
-    def analyze(self, candles=None, *args, **kwargs):
-        """
-        Returns:
-            "UP", "DOWN", or None
-        """
-        if not self.enabled:
-            return None
+        return {
+            "signal": signal,
+            "strategy": "RANDOM",
+            "reason": "Random signal generated",
+        }
 
-        if candles is not None and len(candles) < 1:
-            return None
+    def get_signal(self, candles=None) -> str:
+        return self.analyze(candles)["signal"]
 
-        return random.choice(["UP", "DOWN"])
-
-    def get_signal(self, candles=None, *args, **kwargs):
-        return self.analyze(candles, *args, **kwargs)
+    def generate_signal(self, candles=None) -> Dict[str, Any]:
+        return self.analyze(candles)
 
 
-def generate_signal(candles=None):
-    """Simple function interface for compatibility."""
-    if candles is not None and len(candles) < 1:
-        return None
+def analyze(candles=None) -> Dict[str, Any]:
+    return RandomStrategy().analyze(candles)
 
-    return random.choice(["UP", "DOWN"])
+
+def get_signal(candles=None) -> str:
+    return RandomStrategy().get_signal(candles)
+
+
+def generate_signal(candles=None) -> Dict[str, Any]:
+    return RandomStrategy().generate_signal(candles)
