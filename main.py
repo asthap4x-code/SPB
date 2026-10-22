@@ -15,10 +15,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from database import init_db, add_user, save_signal, recent_signals, stats, record_result
 from stm_strategy import analyze as stm_analyze
 
-# Optional strategy modules: a missing optional file must not prevent the bot
-# from starting. PVIP falls back to the project's STM analyzer when the user
-# keeps PVIP logic inside stm_strategy.py. PVIP2 stays unavailable unless its
-# own analyzer module exists, rather than pretending STM is PVIP2.
+# Existing project strategies only. PVIP/PVIP2 are not imported as extra modules;
+# keep the strategy list aligned with the user's existing STM/AI/RANDOM files.
 try:
     from ai_strategy import analyze as ai_analyze
 except Exception as exc:
@@ -32,16 +30,6 @@ try:
 except Exception as exc:
     random_analyze = None
     log_import_error = (log_import_error + " | " if log_import_error else "") + f"RANDOM strategy unavailable: {exc}"
-
-try:
-    from stm_pvip_strategy import analyze as pvip_analyze
-except Exception:
-    pvip_analyze = stm_analyze
-
-try:
-    from stm_pvip2_strategy import analyze as pvip2_analyze
-except Exception:
-    pvip2_analyze = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -67,7 +55,7 @@ MARKETS = {
 }
 CATEGORY_ORDER = ["FOREX", "COMMODITIES", "CRYPTO", "CURRENCY"]
 CATEGORY_LABELS = {"FOREX": "FOREX", "COMMODITIES": "COMMODITIES", "CRYPTO": "CRYPTO", "CURRENCY": "CURRENCY"}
-STRATEGY_LABELS = {"AI": "AI STRATEGY", "STM": "STM STRATEGY", "PVIP": "STM PVIP STRATEGY", "PVIP2": "STM PVIP 2 STRATEGY", "RANDOM": "RANDOM STRATEGY", "ALL": "SELECT ALL"}
+STRATEGY_LABELS = {"AI": "AI STRATEGY", "STM": "STM STRATEGY", "RANDOM": "RANDOM STRATEGY", "BLACK4X": "BLACK4X STRATEGY", "ALL": "SELECT ALL"}
 
 # Best-effort names for PyQuotex. Unsupported names are skipped, never fabricated into a signal.
 SYMBOLS = {
@@ -122,7 +110,7 @@ class QuotexDemoFeed:
             self.client, self.connected = None, False
             raise MarketDataError(f"Quotex সংযোগ ব্যর্থ: {type(exc).__name__}: {exc}")
 
-    async def candles(self, asset, period=60, count=100):
+    async def candles(self, asset, period=60, count=100, min_valid=2):
         await self.connect()
         try:
             raw = await self.client.get_candles(asset, time.time(), count, period)
@@ -145,8 +133,8 @@ class QuotexDemoFeed:
             # the broker's displayed label; successful fresh candles are the availability check.
             now = time.time()
             rows = [r for r in rows if r["time"] <= now + 2]
-            if len(rows) < 25:
-                raise MarketDataError(f"{asset}: পর্যাপ্ত valid candle নেই ({len(rows)}টি)।")
+            if len(rows) < min_valid:
+                raise MarketDataError(f"{asset}: পর্যাপ্ত valid candle নেই ({len(rows)}টি; দরকার {min_valid}টি)।")
             if now - rows[-1]["time"] > max(180, period * 3):
                 raise MarketDataError(f"{asset}: candle feed stale (সর্বশেষ candle {int(now - rows[-1]['time'])}s পুরোনো)।")
             return rows
@@ -196,6 +184,20 @@ class QuotexDemoFeed:
             except Exception:
                 pass
         self.client, self.connected = None, False
+
+def black4x_analyze(candles):
+    """BLACK4X: follow the last fully closed candle's direction for the next candle."""
+    if len(candles) < 2:
+        return None
+    last = candles[-1]
+    if last["close"] > last["open"]:
+        direction = "CALL"
+    elif last["close"] < last["open"]:
+        direction = "PUT"
+    else:
+        return None  # do not invent a direction for a doji candle
+    return {"direction": direction, "confidence": 50,
+            "reason": "BLACK4X: follows the direction of the latest completed Quotex candle; not a guarantee."}
 
 feed = QuotexDemoFeed()
 # per-user wizard state; reset if bot process restarts
@@ -272,7 +274,7 @@ def pair_keyboard(prefs):
     return InlineKeyboardMarkup(rows)
 
 def strategy_keyboard(prefs):
-    rows = [[InlineKeyboardButton(STRATEGY_LABELS[k], callback_data=f"strategy:{k}")] for k in ("AI", "STM", "PVIP", "PVIP2", "RANDOM", "ALL")]
+    rows = [[InlineKeyboardButton(STRATEGY_LABELS[k], callback_data=f"strategy:{k}")] for k in ("AI", "STM", "RANDOM", "BLACK4X", "ALL")]
     rows.append([InlineKeyboardButton("⬅️ Back to Pairs", callback_data="pairs_open")])
     return InlineKeyboardMarkup(rows)
 
@@ -408,9 +410,11 @@ async def _candle_outcome(symbol, candle_start, direction):
     if time.time() < candle_start + SIGNAL_EXPIRY_SECONDS:
         raise MarketDataError(f"{symbol}: target candle has not closed yet")
     if candle["close"] == candle["open"]:
-        return "DRAW"
-    candle_direction = "CALL" if candle["close"] > candle["open"] else "PUT"
-    return "WIN" if candle_direction == direction else "LOSS"
+        outcome = "DRAW"
+    else:
+        candle_direction = "CALL" if candle["close"] > candle["open"] else "PUT"
+        outcome = "WIN" if candle_direction == direction else "LOSS"
+    return {"outcome": outcome, "open": candle["open"], "close": candle["close"], "time": candle["time"]}
 
 
 async def settle_signal(app, signal_id, pair, symbol, direction, destination, trade_start):
@@ -421,18 +425,19 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
     """
     outcome = "UNKNOWN"
     result_stage = "FIRST CANDLE"
+    first = second = None
     try:
         await asyncio.sleep(max(0, trade_start + SIGNAL_EXPIRY_SECONDS - time.time() + 2))
         first = await _candle_outcome(symbol, trade_start, direction)
-        if first == "WIN":
+        if first["outcome"] == "WIN":
             outcome = "WIN"
-        elif first == "DRAW":
+        elif first["outcome"] == "DRAW":
             outcome = "DRAW"
         else:
             result_stage = "MTG CANDLE"
             await asyncio.sleep(max(0, trade_start + 2 * SIGNAL_EXPIRY_SECONDS - time.time() + 2))
             second = await _candle_outcome(symbol, trade_start + SIGNAL_EXPIRY_SECONDS, direction)
-            outcome = "WIN" if second == "WIN" else ("LOSS" if second == "LOSS" else "DRAW")
+            outcome = "WIN" if second["outcome"] == "WIN" else ("LOSS" if second["outcome"] == "LOSS" else "DRAW")
     except Exception as exc:
         log.warning("Result could not be verified for signal #%s: %s", signal_id, exc)
 
@@ -463,8 +468,11 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
         f"💱 Pair: {pair}\n"
         f"⏱️ Trade time: {datetime.fromtimestamp(trade_start).strftime('%H:%M')}–{datetime.fromtimestamp(trade_start + 60).strftime('%H:%M')}\n"
         f"🔮 Direction: {direction_text}\n"
-        f"🧾 Result check: {result_stage}\n\n"
-        f"{result_text}\n"
+        f"🧾 Result check: {result_stage}\n"
+        + (f"📈 FIRST CANDLE — Open: {first['open']} | Close: {first['close']}\n" if first else "📈 FIRST CANDLE — Open: unavailable | Close: unavailable\n")
+        + (f"📉 MTG CANDLE — Open: {second['open']} | Close: {second['close']}\n" if second else "")
+        + "\n"
+        + f"{result_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔥 WIN: {wins} | 😣 LOSS: {losses}\n"
         f"💎 THIS PAIR: {pair_wins}W × {pair_losses}L\n"
@@ -474,10 +482,11 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
         "Please share honest feedback to help keep the bot running.\n"
         "⚠️ Result is calculated from Quotex 1-minute candles; MTG uses the next candle after a first-candle LOSS. The bot does not execute trades or verify broker P/L."
     )
-    try:
-        await app.bot.send_message(chat_id=destination, text=result_post)
-    except Exception:
-        log.exception("Could not post result for signal #%s", signal_id)
+    for target in destination if isinstance(destination, (list, tuple, set)) else [destination]:
+        try:
+            await app.bot.send_message(chat_id=target, text=result_post)
+        except Exception:
+            log.exception("Could not post result for signal #%s to %s", signal_id, target)
 
 async def run_analysis(message, uid, context):
     global signals_enabled
@@ -506,11 +515,10 @@ async def run_analysis(message, uid, context):
     methods = {
         "AI": ("AI STRATEGY", ai_analyze),
         "STM": ("STM STRATEGY", stm_analyze),
-        "PVIP": ("STM PVIP STRATEGY", pvip_analyze),
-        "PVIP2": ("STM PVIP 2 STRATEGY", pvip2_analyze),
         "RANDOM": ("RANDOM STRATEGY", random_analyze),
+        "BLACK4X": ("BLACK4X STRATEGY", black4x_analyze),
     }
-    method_order = ["AI", "STM", "PVIP", "PVIP2", "RANDOM"] if strategy == "ALL" else [strategy]
+    method_order = ["AI", "STM", "BLACK4X", "RANDOM"] if strategy == "ALL" else [strategy]
     errors, found, valid_markets = [], None, []
     # First establish which selected symbols actually return fresh, valid Quotex candles.
     # RANDOM chooses direction only after this validation; it cannot invent a market.
@@ -520,8 +528,12 @@ async def run_analysis(message, uid, context):
             errors.append(f"{pair}: symbol mapping নেই")
             continue
         try:
-            candles = await feed.candles(symbol, 60, 100)
-            valid_markets.append((pair, symbol, candles))
+            candles = await feed.candles(symbol, 60, 100, min_valid=2)
+            # Strategies receive completed candles only, avoiding a still-forming candle.
+            closed = [c for c in candles if c["time"] + 60 <= time.time() + 1]
+            if len(closed) < 2:
+                raise MarketDataError(f"{symbol}: 2টি completed candle পাওয়া যায়নি")
+            valid_markets.append((pair, symbol, closed))
         except Exception as exc:
             log.warning("Market validation failed for %s (%s): %s", pair, symbol, exc)
             errors.append(f"{pair} [{symbol}]: {type(exc).__name__}: {exc}")
@@ -536,12 +548,15 @@ async def run_analysis(message, uid, context):
             errors.append(f"Unknown strategy: {method_key}")
             continue
         candidates = valid_markets.copy()
-        if method_key == "RANDOM":
-            pair, symbol, candles = secrets.choice(candidates)
-            random_result = random_analyze(candles)
-            if random_result and random_result.get("direction") in ("CALL", "PUT"):
-                found = {"pair": pair, "symbol": symbol, "strategy": label, **random_result,
-                         "reason": "Random direction on a pair with validated fresh Quotex candles; not predictive."}
+        if method_key in ("RANDOM", "BLACK4X"):
+            eligible = [(p, sym, cs) for p, sym, cs in candidates if len(cs) >= 2]
+            if not eligible:
+                errors.append(f"{method_key}: 2টি completed candle-সহ valid market নেই")
+                continue
+            pair, symbol, candles = secrets.choice(eligible)
+            result = method(candles)
+            if result and result.get("direction") in ("CALL", "PUT"):
+                found = {"pair": pair, "symbol": symbol, "strategy": label, **result}
             break
         for pair, symbol, candles in candidates:
             try:
@@ -561,6 +576,13 @@ async def run_analysis(message, uid, context):
     if not signals_enabled:
         await message.reply_text("🛑 Analysis চলাকালে admin signals OFF করেছেন; signal পোস্ট করা হয়নি।")
         return
+    # Fetch payout before scheduling so a slow payout API call does not delay the signal.
+    payout_value = None
+    try:
+        payout_value = await feed.payout(found["symbol"]) if found.get("symbol") else None
+    except Exception as exc:
+        log.info("Quotex payout unavailable for %s: %s", found.get("symbol"), exc)
+
     # Schedule the signal exactly 5 seconds before the next minute boundary.
     # Example: if the trade minute is 20:19:00, post at 20:18:55.
     current_ts = time.time()
@@ -578,9 +600,10 @@ async def run_analysis(message, uid, context):
     # Re-check the chosen pair shortly before posting so a disconnected/stale feed
     # cannot silently pass as a live market. Direction stays from selected strategy.
     try:
-        fresh = await feed.candles(found["symbol"], 60, 30)
-        if not fresh or time.time() - fresh[-1]["time"] > 180:
-            raise MarketDataError("latest candle is stale")
+        fresh = await feed.candles(found["symbol"], 60, 30, min_valid=2)
+        completed = [c for c in fresh if c["time"] + 60 <= time.time() + 1]
+        if len(completed) < 2 or time.time() - completed[-1]["time"] > 180:
+            raise MarketDataError("latest completed candle is stale or missing")
     except Exception as exc:
         await message.reply_text(f"❌ Signal বাতিল: {found['pair']} এর live Quotex candle পুনরায় যাচাই করা যায়নি ({type(exc).__name__}: {exc})")
         return
@@ -590,12 +613,14 @@ async def run_analysis(message, uid, context):
     session_signals.append({"id": sid, "date": trade_dt.strftime("%Y-%m-%d"), "time": trade_dt.strftime("%H:%M"),
                             "pair": found["pair"], "direction": found["direction"], "outcome": None})
     direction_text = "🔴 𝗣𝗨𝗧 ▼" if found["direction"] == "PUT" else "🟢 𝗖𝗔𝗟𝗟 ▲"
-    destination = CHANNEL_ID if CHANNEL_ID else message.chat_id
-    payout_value = None
-    try:
-        payout_value = await feed.payout(found["symbol"]) if found.get("symbol") else None
-    except Exception as exc:
-        log.info("Quotex payout unavailable for %s: %s", found.get("symbol"), exc)
+    destinations = []
+    if CHANNEL_ID:
+        destinations.append(CHANNEL_ID)
+    # Also send to the requesting user's bot chat; user must have started the bot.
+    if uid not in destinations:
+        destinations.append(uid)
+    if not destinations:
+        destinations = [message.chat_id]
     payout_text = f"{payout_value:g}% (Quotex)" if payout_value is not None else "Unavailable from Quotex API"
     signal_post = (
         "🤖 𝗦𝗧𝗠 𝗣𝗥𝗢 𝗕𝗢𝗧\n"
@@ -612,13 +637,22 @@ async def run_analysis(message, uid, context):
         f"Strategy: {found['strategy']} | Signal ID: #{sid}\n"
         "⚠️ 1-minute candle. Direction is not a guaranteed prediction."
     )
-    try:
-        await context.bot.send_message(chat_id=destination, text=signal_post)
-    except Exception as exc:
-        await message.reply_text(f"Signal save হয়েছে, কিন্তু post পাঠানো যায়নি: {type(exc).__name__}: {exc}")
+    sent_any = False
+    send_errors = []
+    for target in destinations:
+        try:
+            await context.bot.send_message(chat_id=target, text=signal_post)
+            sent_any = True
+        except Exception as exc:
+            send_errors.append(f"{target}: {type(exc).__name__}: {exc}")
+            log.warning("Signal post failed to %s: %s", target, exc)
+    if not sent_any:
+        await message.reply_text("Signal তৈরি হয়েছে, কিন্তু channel/bot—কোনো জায়গায় পোস্ট যায়নি.\n" + "\n".join(send_errors))
         return
+    if send_errors:
+        await message.reply_text("⚠️ Signal অন্তত এক জায়গায় পোস্ট হয়েছে; কিছু destination-এ পাঠানো যায়নি.\n" + "\n".join(send_errors))
     if found.get("symbol"):
-        context.application.create_task(settle_signal(context.application, sid, found["pair"], found["symbol"], found["direction"], destination, trade_start))
+        context.application.create_task(settle_signal(context.application, sid, found["pair"], found["symbol"], found["direction"], destinations, trade_start))
     else:
         await message.reply_text("ℹ️ Signal post হয়েছে; pair symbol mapping না থাকায় result verify করা যাবে না।")
 
@@ -727,10 +761,6 @@ def main():
     log.info("Starting %s", BOT_NAME)
     if log_import_error:
         log.warning(log_import_error)
-    if pvip_analyze is stm_analyze:
-        log.warning("PVIP module not found; PVIP selection uses stm_strategy.analyze fallback")
-    if pvip2_analyze is None:
-        log.warning("PVIP2 module not found; PVIP2 selection will report unavailable")
     # Python 3.14 no longer guarantees an implicit event loop in MainThread.
     # python-telegram-bot's run_polling() expects one to exist before it starts.
     try:
