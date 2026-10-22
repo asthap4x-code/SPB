@@ -13,11 +13,35 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from database import init_db, add_user, save_signal, recent_signals, stats, record_result
-from ai_strategy import analyze as ai_analyze
 from stm_strategy import analyze as stm_analyze
-from random_strategy import analyze as random_analyze
-from stm_pvip_strategy import analyze as pvip_analyze
-from stm_pvip2_strategy import analyze as pvip2_analyze
+
+# Optional strategy modules: a missing optional file must not prevent the bot
+# from starting. PVIP falls back to the project's STM analyzer when the user
+# keeps PVIP logic inside stm_strategy.py. PVIP2 stays unavailable unless its
+# own analyzer module exists, rather than pretending STM is PVIP2.
+try:
+    from ai_strategy import analyze as ai_analyze
+except Exception as exc:
+    ai_analyze = None
+    log_import_error = f"AI strategy unavailable: {exc}"
+else:
+    log_import_error = None
+
+try:
+    from random_strategy import analyze as random_analyze
+except Exception as exc:
+    random_analyze = None
+    log_import_error = (log_import_error + " | " if log_import_error else "") + f"RANDOM strategy unavailable: {exc}"
+
+try:
+    from stm_pvip_strategy import analyze as pvip_analyze
+except Exception:
+    pvip_analyze = stm_analyze
+
+try:
+    from stm_pvip2_strategy import analyze as pvip2_analyze
+except Exception:
+    pvip2_analyze = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -701,6 +725,12 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^/STMOP(?:@\w+)?(?:\s|$)"), stmop_cmd))
     app.add_handler(CallbackQueryHandler(callback))
     log.info("Starting %s", BOT_NAME)
+    if log_import_error:
+        log.warning(log_import_error)
+    if pvip_analyze is stm_analyze:
+        log.warning("PVIP module not found; PVIP selection uses stm_strategy.analyze fallback")
+    if pvip2_analyze is None:
+        log.warning("PVIP2 module not found; PVIP2 selection will report unavailable")
     # Python 3.14 no longer guarantees an implicit event loop in MainThread.
     # python-telegram-bot's run_polling() expects one to exist before it starts.
     try:
