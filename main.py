@@ -1,6 +1,5 @@
-"""STM PRO BOT - Option B main file.
-Quotex read-only demo feed and Telegram workflow live here. Strategy logic and DB stay separate.
-No order execution is implemented.
+"""STM PRO BOT main.py — Quotex candle-based signals and result tracking.
+Read-only market data; no order execution. Actual API fields depend on PyQuotex version.
 """
 import os
 import time
@@ -117,6 +116,40 @@ class QuotexDemoFeed:
             raise
         except Exception as exc:
             raise MarketDataError(f"{asset}: candle read failed: {type(exc).__name__}: {exc}")
+
+    async def payout(self, asset):
+        """Best-effort read-only payout lookup; returns a real value or None.
+
+        PyQuotex versions expose different APIs, so do not fabricate a payout.
+        """
+        await self.connect()
+        for method_name in ("get_payment", "get_payout", "get_payments"):
+            method = getattr(self.client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                data = method()
+                if asyncio.iscoroutine(data):
+                    data = await data
+                if isinstance(data, dict):
+                    candidates = (asset, asset.lower(), asset.upper())
+                    for key in candidates:
+                        value = data.get(key)
+                        if isinstance(value, dict):
+                            value = value.get("profit", value.get("payout", value.get("payment")))
+                        if isinstance(value, (int, float)) and 0 <= value <= 100:
+                            return float(value)
+                if isinstance(data, list):
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        name = item.get("asset", item.get("symbol", item.get("name")))
+                        value = item.get("profit", item.get("payout", item.get("payment")))
+                        if name == asset and isinstance(value, (int, float)) and 0 <= value <= 100:
+                            return float(value)
+            except Exception as exc:
+                log.debug("Payout lookup via %s unavailable: %s", method_name, exc)
+        return None
 
     async def close(self):
         if self.client:
@@ -296,7 +329,7 @@ def _format_final_reports():
         f"💎 STM PRO BOT ACCURACY: {rate:.1f}% (settled signals only)\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         "Please send your feedback with a fresh mind.\n"
-        "Feedback ID: your Telegram username\n"
+        f"Feedback ID: {FEEDBACK_ID or 'Not configured in .env'}\n"
         "If feedback is insufficient, the bot owner may pause the service.\n"
         "⚠️ Past results do not guarantee future outcomes."
     )
@@ -345,6 +378,7 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
     reported second-candle recovery is a candle-based proxy, not broker P/L.
     """
     outcome = "UNKNOWN"
+    result_stage = "FIRST CANDLE"
     try:
         await asyncio.sleep(max(0, trade_start + SIGNAL_EXPIRY_SECONDS - time.time() + 2))
         first = await _candle_outcome(symbol, trade_start, direction)
@@ -353,7 +387,7 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
         elif first == "DRAW":
             outcome = "DRAW"
         else:
-            # One additional minute is counted as a win if direction matches.
+            result_stage = "MTG CANDLE"
             await asyncio.sleep(max(0, trade_start + 2 * SIGNAL_EXPIRY_SECONDS - time.time() + 2))
             second = await _candle_outcome(symbol, trade_start + SIGNAL_EXPIRY_SECONDS, direction)
             outcome = "WIN" if second == "WIN" else ("LOSS" if second == "LOSS" else "DRAW")
@@ -380,13 +414,14 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
     pair_wins = sum(x.get("outcome") == "WIN" for x in pair_rows)
     pair_losses = sum(x.get("outcome") == "LOSS" for x in pair_rows)
     accuracy = wins / len(settled) * 100 if settled else 0
-    feedback = FEEDBACK_ID or "@your_feedback_username"
+    feedback = FEEDBACK_ID or "Not configured (set FEEDBACK_ID in .env)"
     result_post = (
         "📊 𝗦𝗧𝗠 𝗣𝗥𝗢 𝗕𝗢𝗧 — 𝗥𝗘𝗦𝗨𝗟𝗧\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 Pair: {pair}\n"
         f"⏱️ Trade time: {datetime.fromtimestamp(trade_start).strftime('%H:%M')}–{datetime.fromtimestamp(trade_start + 60).strftime('%H:%M')}\n"
-        f"🔮 Direction: {direction_text}\n\n"
+        f"🔮 Direction: {direction_text}\n"
+        f"🧾 Result check: {result_stage}\n\n"
         f"{result_text}\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"🔥 WIN: {wins} | 😣 LOSS: {losses}\n"
@@ -395,7 +430,7 @@ async def settle_signal(app, signal_id, pair, symbol, direction, destination, tr
         "━━━━━━━━━━━━━━━━━━━━━\n"
         f"💬 Feedback: {feedback}\n"
         "Please share honest feedback to help keep the bot running.\n"
-        "⚠️ Candle-based estimate only; this bot does not execute trades or verify broker P/L."
+        "⚠️ Result is calculated from Quotex 1-minute candles; MTG uses the next candle after a first-candle LOSS. The bot does not execute trades or verify broker P/L."
     )
     try:
         await app.bot.send_message(chat_id=destination, text=result_post)
@@ -481,8 +516,12 @@ async def run_analysis(message, uid, context):
                             "pair": found["pair"], "direction": found["direction"], "outcome": None})
     direction_text = "🔴 𝗣𝗨𝗧 ▼" if found["direction"] == "PUT" else "🟢 𝗖𝗔𝗟𝗟 ▲"
     destination = CHANNEL_ID if CHANNEL_ID else message.chat_id
-    payout_text = "Not available from current Quotex feed"
-    # Do not invent payout. A payout value is only shown if a future supported adapter returns one.
+    payout_value = None
+    try:
+        payout_value = await feed.payout(found["symbol"]) if found.get("symbol") else None
+    except Exception as exc:
+        log.info("Quotex payout unavailable for %s: %s", found.get("symbol"), exc)
+    payout_text = f"{payout_value:g}% (Quotex)" if payout_value is not None else "Unavailable from Quotex API"
     signal_post = (
         "🤖 𝗦𝗧𝗠 𝗣𝗥𝗢 𝗕𝗢𝗧\n"
         "━━━━━━━━━━━━━━━━━━━━━\n"
