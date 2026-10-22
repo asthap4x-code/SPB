@@ -7,11 +7,13 @@ import time
 import asyncio
 import logging
 import secrets
+import sqlite3
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
-from database import init_db, add_user, save_signal, recent_signals, stats
+from database import init_db, add_user, save_signal, recent_signals, stats, record_result
 from ai_strategy import analyze as ai_analyze
 from stm_strategy import analyze as stm_analyze
 from random_strategy import analyze as random_analyze
@@ -25,6 +27,9 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 BOT_NAME = "STM PRO BOT"
 PAGE_SIZE = 10
+SIGNAL_EXPIRY_SECONDS = 60
+signals_enabled = True
+session_signals = []  # current process session; persisted outcomes remain in SQLite
 
 # Display labels are kept exactly as requested. Quotex symbol support can vary by account/session.
 MARKETS = {
@@ -232,27 +237,165 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"📊 Signal Tracking\nTotal: {s['total']}\nWins: {s['wins']}\nLosses: {s['losses']}\nPending: {s['pending']}\nSettled win rate: {s['rate']:.1f}%")
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Legacy admin command; admin identity is always checked before actions."""
     user, msg = update.effective_user, update.effective_message
-    if not user or not msg: return
+    if not user or not msg:
+        return
     if user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Admin only."); return
+        await msg.reply_text("⛔ Admin only.")
+        return
     if not context.args:
-        await msg.reply_text("Usage: /secret status | /secret scan"); return
-    if context.args[0].lower() == "status": await status_cmd(update, context)
-    elif context.args[0].lower() == "scan": await run_analysis(msg, user.id, context)
-    else: await msg.reply_text("Available: status, scan")
+        await msg.reply_text("Usage: /secret status | /secret scan | /secret on")
+        return
+    action = context.args[0].lower()
+    if action == "status":
+        await status_cmd(update, context)
+    elif action == "scan":
+        await run_analysis(msg, user.id, context)
+    elif action == "on":
+        global signals_enabled
+        signals_enabled = True
+        await msg.reply_text("✅ Signals ON করা হয়েছে।")
+    else:
+        await msg.reply_text("Available: status, scan, on")
+
+
+def _today_session_rows():
+    today = datetime.now().strftime("%Y-%m-%d")
+    return [x for x in session_signals if x.get("date") == today]
+
+
+def _format_final_reports():
+    rows = _today_session_rows()
+    date_text = datetime.now().strftime("%Y-%m-%d")
+    market_lines = []
+    for row in rows:
+        mark = "✅" if row.get("outcome") == "WIN" else ("✖️" if row.get("outcome") == "LOSS" else "⌛")
+        market_lines.append(f"❒ {row['time']} - {row['pair']} - {row['direction']} {mark}")
+    if not market_lines:
+        market_lines = ["আজ এই bot session-এ কোনো signal record হয়নি।"]
+    settled = [x for x in rows if x.get("outcome") in ("WIN", "LOSS")]
+    wins = sum(x.get("outcome") == "WIN" for x in settled)
+    losses = sum(x.get("outcome") == "LOSS" for x in settled)
+    rate = (wins / len(settled) * 100) if settled else 0
+    report1 = (
+        "========== STM PRO BOT ==========\n"
+        "━━━━━━━━━・━━━━━━━━━\n"
+        f"📆 - {date_text}\n"
+        "━━━━━━━━━・━━━━━━━━━\n"
+        "💶 OTC / SELECTED MARKETS FINAL 💶\n"
+        + "\n".join(market_lines)
+        + "\n━━━━━━━━━・━━━━━━━━━\n"
+    )
+    report2 = (
+        "📊 STMPRO BOT FINAL RESULT\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 WIN: {wins} | 😣 LOSS: {losses} | ⌛ PENDING: {sum(x.get('outcome') not in ('WIN','LOSS') for x in rows)}\n"
+        f"💎 STM PRO BOT ACCURACY: {rate:.1f}% (settled signals only)\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Please send your feedback with a fresh mind.\n"
+        "Feedback ID: your Telegram username\n"
+        "If feedback is insufficient, the bot owner may pause the service.\n"
+        "⚠️ Past results do not guarantee future outcomes."
+    )
+    return report1, report2
+
+
+async def stmop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Secret stop command. Verify admin ID before stopping signals or posting reports."""
+    user, msg = update.effective_user, update.effective_message
+    if not user or not msg:
+        return
+    if user.id not in ADMIN_IDS:
+        await msg.reply_text("⛔ Admin only.")
+        return
+    global signals_enabled
+    signals_enabled = False
+    report1, report2 = _format_final_reports()
+    target = CHANNEL_ID if CHANNEL_ID else msg.chat_id
+    try:
+        await context.bot.send_message(chat_id=target, text=report1)
+        await context.bot.send_message(chat_id=target, text=report2)
+        await msg.reply_text("🛑 Signals OFF করা হয়েছে। Final report-এর ২টি message পাঠানো হয়েছে। আবার চালু করতে /secret on দিন।")
+    except Exception as exc:
+        log.exception("Could not send final reports")
+        await msg.reply_text(f"🛑 Signals OFF হয়েছে, কিন্তু report পাঠানো যায়নি: {type(exc).__name__}: {exc}")
+
+
+async def settle_signal(app, signal_id, pair, symbol, direction, destination, started_at):
+    """Try to verify the 1-minute candle result; never invent WIN/LOSS if data is unavailable."""
+    await asyncio.sleep(SIGNAL_EXPIRY_SECONDS + 2)
+    outcome = "UNKNOWN"
+    try:
+        candles = await feed.candles(symbol, 60, 30)
+        candidates = [c for c in candles if c.get("time", 0) >= started_at]
+        candle = candidates[-1] if candidates else candles[-1]
+        if candle["close"] > candle["open"]:
+            candle_direction = "CALL"
+        elif candle["close"] < candle["open"]:
+            candle_direction = "PUT"
+        else:
+            candle_direction = "DRAW"
+        if candle_direction == "DRAW":
+            outcome = "DRAW"
+        elif candle_direction == direction:
+            outcome = "WIN"
+        else:
+            outcome = "LOSS"
+        if outcome in ("WIN", "LOSS", "DRAW"):
+            await record_result(signal_id, outcome)
+    except Exception as exc:
+        log.warning("Result could not be verified for signal #%s: %s", signal_id, exc)
+    for row in reversed(session_signals):
+        if row.get("id") == signal_id:
+            row["outcome"] = outcome
+            break
+    direction_text = "🔴 𝗣𝗨𝗧" if direction == "PUT" else "🟢 𝗖𝗔𝗟𝗟"
+    result_text = "🌟 Non mtg 𝗪𝗜𝗡" if outcome == "WIN" else ("😣 𝗟𝗢𝗦𝗦" if outcome == "LOSS" else ("➖ DRAW" if outcome == "DRAW" else "⌛ RESULT UNVERIFIED"))
+    today_rows = _today_session_rows()
+    settled = [x for x in today_rows if x.get("outcome") in ("WIN", "LOSS")]
+    wins = sum(x.get("outcome") == "WIN" for x in settled)
+    losses = sum(x.get("outcome") == "LOSS" for x in settled)
+    total_pair = [x for x in settled if x.get("pair") == pair]
+    pair_wins = sum(x.get("outcome") == "WIN" for x in total_pair)
+    pair_losses = sum(x.get("outcome") == "LOSS" for x in total_pair)
+    accuracy = wins / len(settled) * 100 if settled else 0
+    result_post = (
+        "📊 STMPRO BOT 𝗥𝗘𝗦𝗨𝗟𝗧\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Pair: {pair}\n"
+        f"⏱️ Time: {datetime.now().strftime('%H:%M')}\n"
+        f"🔮 Direction: {direction_text}\n\n"
+        f"{result_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 WIN: {wins} | 😣 LOSS: {losses}\n"
+        f"💎 THIS PAIR: {pair_wins}W × {pair_losses}L\n"
+        f"📊 STM PRO BOT ACCURACY: {accuracy:.1f}%\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "Please share honest feedback: your Telegram username\n"
+        "⚠️ Result is based on the available 1-minute candle; if data was unavailable it is marked unverified."
+    )
+    try:
+        await app.bot.send_message(chat_id=destination, text=result_post)
+    except Exception:
+        log.exception("Could not post result for signal #%s", signal_id)
 
 async def run_analysis(message, uid, context):
+    global signals_enabled
+    if not signals_enabled:
+        await message.reply_text("🛑 Signals বর্তমানে OFF। Admin চালু না করা পর্যন্ত নতুন signal দেওয়া হবে না।")
+        return
     prefs = setup_user(uid)
-    # Re-check Telegram membership at signal time; cached verification alone is insufficient.
     if not await member_ok(context, uid):
         context.user_data.pop("channel_verified", None)
-        await message.reply_text("⛔ আগে Telegram channel membership verify করুন।", reply_markup=welcome_keyboard()); return
+        await message.reply_text("⛔ আগে Telegram channel membership verify করুন।", reply_markup=welcome_keyboard())
+        return
     context.user_data["channel_verified"] = True
     pairs = selected_pairs(prefs)
     strategy = prefs.get("strategy")
     if not pairs or not strategy:
-        await message.reply_text("আগে category, pair ও strategy নির্বাচন সম্পূর্ণ করুন।", reply_markup=categories_keyboard(prefs)); return
+        await message.reply_text("আগে category, pair ও strategy নির্বাচন সম্পূর্ণ করুন।", reply_markup=categories_keyboard(prefs))
+        return
     for line in WARNINGS:
         try:
             sent = await message.reply_text("⚠️ " + line)
@@ -260,47 +403,72 @@ async def run_analysis(message, uid, context):
             await sent.delete()
         except Exception:
             log.warning("Could not delete warning message", exc_info=True)
-    await message.reply_text("🔎 Quotex market data যাচাই করে analysis চলছে…\nএকটি analysis cycle-এ সর্বোচ্চ ১টি signal পাঠানো হবে।")
+    await message.reply_text("🔎 Analysis চলছে… এক cycle-এ সর্বোচ্চ ১টি signal পাঠানো হবে।")
     methods = {"AI": ("AI STRATEGY", ai_analyze), "STM": ("STM STRATEGY", stm_analyze), "RANDOM": ("RANDOM STRATEGY", random_analyze)}
-    if strategy == "ALL":
-        method_order = ["AI", "STM", "RANDOM"]
-    else:
-        method_order = [strategy]
-    errors = []
-    found = None
-    # ALL means scan all chosen pairs with AI first, then STM, then Random as fallback.
+    method_order = ["AI", "STM", "RANDOM"] if strategy == "ALL" else [strategy]
+    errors, found = [], None
     for method_key in method_order:
         label, method = methods[method_key]
+        # RANDOM really means random: no Quotex candle fetch is needed to choose a direction.
+        if method_key == "RANDOM":
+            pair = secrets.choice(pairs)
+            found = {"pair": pair, "symbol": SYMBOLS.get(pair), "strategy": label,
+                     "direction": secrets.choice(("CALL", "PUT")), "confidence": 50,
+                     "reason": "Random direction; not market-derived."}
+            break
         for pair in pairs:
             symbol = SYMBOLS.get(pair)
             if not symbol:
                 continue
             try:
                 candles = await feed.candles(symbol, 60, 100)
-            except MarketDataError as exc:
-                errors.append(f"{pair}: {exc}")
-                continue
-            try:
                 result = method(candles)
             except Exception as exc:
-                log.exception("Strategy %s failed on %s", method_key, pair)
-                errors.append(f"{pair}: strategy error {type(exc).__name__}")
+                log.warning("Analysis failed for %s: %s", pair, exc)
+                errors.append(f"{pair}: {type(exc).__name__}: {exc}")
                 continue
-            if method_key == "RANDOM":
-                # Random fallback must still require successfully retrieved candles.
-                result = result or {"direction": secrets.choice(("CALL", "PUT")), "confidence": 50, "reason": "Random fallback direction; not market-derived."}
             if result and result.get("direction") in ("CALL", "PUT"):
                 found = {"pair": pair, "symbol": symbol, "strategy": label, **result}
                 break
         if found:
             break
     if not found:
-        detail = "\n".join(errors[:4])
-        await message.reply_text("❌ কোনো signal তৈরি করা যায়নি। Quotex candle data পাওয়া যায়নি বা strategy qualify করেনি।\n\n" + (detail if detail else "No qualified setup found."))
+        await message.reply_text("❌ Signal তৈরি হয়নি। Quotex candle data পাওয়া যায়নি বা strategy qualify করেনি.\n\n" + "\n".join(errors[:4]))
         return
-    sid = await save_signal(uid, found["pair"], found["direction"], found["strategy"], int(found.get("confidence", 50)), found.get("reason", "Rule-based analysis"))
-    direction = "UP ⬆️" if found["direction"] == "CALL" else "DOWN ⬇️"
-    await message.reply_text(f"📡 {BOT_NAME} — SIGNAL\n\nPair: {found['pair']}\nDirection: {direction}\nStrategy: {found['strategy']}\nScore: {int(found.get('confidence', 50))}/100\nReason: {found.get('reason', 'Rule-based analysis')}\nSignal ID: #{sid}\nExpiry: 1 minute (analysis only)\n\n⚠️ Score win probability নয়। Signal নিশ্চিত নয়; bot trade execute করে না।")
+    if not signals_enabled:
+        await message.reply_text("🛑 Analysis চলাকালে admin signals OFF করেছেন; signal পোস্ট করা হয়নি।")
+        return
+    sid = await save_signal(uid, found["pair"], found["direction"], found["strategy"], int(found.get("confidence", 50)), found.get("reason", "Analysis"))
+    now = datetime.now()
+    session_signals.append({"id": sid, "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
+                            "pair": found["pair"], "direction": found["direction"], "outcome": None})
+    direction_text = "🔴 𝗣𝗨𝗧 ▼" if found["direction"] == "PUT" else "🟢 𝗖𝗔𝗟𝗟 ▲"
+    # Channel post when configured; otherwise send into the current chat.
+    destination = CHANNEL_ID if CHANNEL_ID else message.chat_id
+    signal_post = (
+        "🤖 STM PRO BOT\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Pair: {found['pair']}\n"
+        f"⏱️ START At: {now.strftime('%H:%M:%S')}\n"
+        f"🔮 Direction: {direction_text}\n"
+        "💰 Payout: Not available\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎯 𝗦𝗜𝗚𝗡𝗔𝗟 𝗖𝗢𝗡𝗙𝗜𝗗𝗘𝗡𝗖𝗘\n"
+        f"{'█' * 10} {int(found.get('confidence', 50))}%\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ 1-MIN CANDLE. Use at most one-step MTG only if you independently choose to trade.\n"
+        f"Strategy: {found['strategy']} | Signal ID: #{sid}\n"
+        "⚠️ Random direction is not a predictive edge; result is not guaranteed."
+    )
+    try:
+        await context.bot.send_message(chat_id=destination, text=signal_post)
+    except Exception as exc:
+        await message.reply_text(f"Signal save হয়েছে, কিন্তু post পাঠানো যায়নি: {type(exc).__name__}: {exc}")
+        return
+    if found.get("symbol"):
+        context.application.create_task(settle_signal(context.application, sid, found["pair"], found["symbol"], found["direction"], destination, time.time()))
+    else:
+        await message.reply_text("ℹ️ Signal post হয়েছে; pair symbol mapping না থাকায় automated result verify করা যাবে না।")
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -401,6 +569,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("secret", admin_cmd))
+    app.add_handler(CommandHandler("stmop", stmop_cmd))
+    app.add_handler(MessageHandler(filters.Regex(r"^/STMOP(?:@\w+)?(?:\s|$)"), stmop_cmd))
     app.add_handler(CallbackQueryHandler(callback))
     log.info("Starting %s", BOT_NAME)
     # Python 3.14 no longer guarantees an implicit event loop in MainThread.
