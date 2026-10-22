@@ -39,7 +39,7 @@ STRATEGY_LABELS = {"AI": "AI STRATEGY", "STM": "STM STRATEGY", "RANDOM": "RANDOM
 
 # Best-effort names for PyQuotex. Unsupported names are skipped, never fabricated into a signal.
 SYMBOLS = {
-    "EUR/USD":"EURUSD", "GBP/USD":"GBPGBP" if False else "GBPUSD", "USD/JPY":"USDJPY", "USD/CHF":"USDCHF", "USD/CAD":"USDCAD", "AUD/USD":"AUDUSD", "NZD/USD":"NZDUSD",
+    "EUR/USD":"EURUSD", "GBP/USD":"GBPUSD", "USD/JPY":"USDJPY", "USD/CHF":"USDCHF", "USD/CAD":"USDCAD", "AUD/USD":"AUDUSD", "NZD/USD":"NZDUSD",
     "UKBrent (OTC)":"UKBrent_otc", "Silver (OTC)":"XAGUSD_otc", "USCrude (OTC)":"USOIL_otc", "Gold (OTC)":"XAUUSD_otc",
     "Bitcoin (OTC)":"BTCUSD_otc", "Ethereum Classic (OTC)":"ETCUSD_otc", "Chainlink (OTC)":"LINKUSD_otc", "Litecoin (OTC)":"LTCUSD_otc", "Toncoin (OTC)":"TONUSD_otc", "Trump (OTC)":"TRUMPUSD_otc", "Ripple (OTC)":"XRPUSD_otc", "Zcash (OTC)":"ZECUSD_otc", "Avalanche (OTC)":"AVAXUSD_otc", "Dash (OTC)":"DASHUSD_otc", "Axie Infinity (OTC)":"AXSUSD_otc", "Polkadot (OTC)":"DOTUSD_otc", "Binance Coin (OTC)":"BNBUSD_otc", "Ethereum (OTC)":"ETHUSD_otc", "Cosmos (OTC)":"ATOMUSD_otc", "Bitcoin Cash (OTC)":"BCHUSD_otc",
 }
@@ -403,6 +403,12 @@ def main():
     app.add_handler(CommandHandler("secret", admin_cmd))
     app.add_handler(CallbackQueryHandler(callback))
     log.info("Starting %s", BOT_NAME)
+    # Python 3.14 no longer guarantees an implicit event loop in MainThread.
+    # python-telegram-bot's run_polling() expects one to exist before it starts.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
